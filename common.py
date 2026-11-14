@@ -1,6 +1,7 @@
 """Shared pieces for the tunnel builders: prompts, validators, status bar, quiet runner."""
 import ipaddress
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -184,12 +185,25 @@ def claim(path, recursive=True):
     _claimed.append((Path(path), recursive))
 
 
+def invoking_user():
+    """(uid, gid) of the person behind sudo, or None. SUDO_UID is 0 when sudo itself was run
+    as root (e.g. `sudo ./ovpn.sh` wrapping `sudo python3 ...`), so fall back to the login name."""
+    uid = os.environ.get("SUDO_UID")
+    if uid and uid != "0":
+        return int(uid), int(os.environ.get("SUDO_GID", uid))
+    try:
+        pw = pwd.getpwnam(os.getlogin())
+    except (OSError, KeyError):
+        return None
+    return (pw.pw_uid, pw.pw_gid) if pw.pw_uid != 0 else None
+
+
 def hand_back():
-    """Under sudo, chown claimed paths to the user who ran sudo so they can browse them."""
-    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
-    if os.geteuid() != 0 or not uid or not gid:
+    """When run as root, chown claimed paths to the invoking user so they can browse them."""
+    user = invoking_user() if os.geteuid() == 0 else None
+    if not user:
         return
-    uid, gid = int(uid), int(gid)
+    uid, gid = user
     for path, recursive in _claimed:
         if not path.exists():
             continue
