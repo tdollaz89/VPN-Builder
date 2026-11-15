@@ -122,6 +122,21 @@ def conf_path(tunnel_dir, node, dev):
     return tunnel_dir / f"{dev or node}.conf"
 
 
+def subnet_client_path(tunnel_dir, c):
+    """Subnet clients share one interface name (e.g. wg0), so each gets its own folder:
+    <tunnel>/<client-name>/<iface>.conf."""
+    client_dir = tunnel_dir / c["name"]
+    client_dir.mkdir(mode=0o700)
+    return client_dir / f"{c['dev']}.conf"
+
+
+def ask_shared_iface(clients, default=None):
+    """One interface name applied to every subnet client."""
+    dev = ask("Client interface name (used for all clients)", default, ifname)
+    for c in clients:
+        c["dev"] = dev
+
+
 def unique_ifname(taken):
     """Validator: a valid interface name not already used in this tunnel (they share a folder)."""
     def check(val):
@@ -166,7 +181,7 @@ def new_tunnel(wg, base_dir):
         cfg["server_ip"], *ips = free_ips(cfg["network"], set(), n_clients + 1)
         clients = [{"name": f"{cfg['name']}-client{i}", "ip": ip, "stem": f"client{i}"}
                    for i, ip in enumerate(ips, 1)]
-        ask_client_ifaces(clients, {cfg["dev"]})
+        ask_shared_iface(clients, cfg["dev"])
     else:
         cfg["server_ip"] = ask("Server tunnel IP", validate=address)
         while True:
@@ -204,7 +219,10 @@ def new_tunnel(wg, base_dir):
         peers = [(c["public"], c["ip"]) for c in clients]
         write_private(server_path, server_conf(cfg, server_private, peers))
         for c in clients:
-            c["path"] = conf_path(tunnel_dir, c["name"], c["dev"])
+            if cfg["topology"] == "subnet":
+                c["path"] = subnet_client_path(tunnel_dir, c)
+            else:
+                c["path"] = conf_path(tunnel_dir, c["name"], c["dev"])
             write_private(c["path"], client_conf(cfg, c["private"], c["ip"], server_public))
         save_meta(tunnel_dir, cfg, clients)
 
@@ -233,8 +251,7 @@ def add_clients(wg, base_dir):
     start = max(int(c["name"].rsplit("client", 1)[1]) for c in clients) + 1
     new = [{"name": f"{name}-client{i}", "ip": ip, "stem": f"client{i}"}
            for i, ip in enumerate(ips, start)]
-    if cfg.get("dev"):
-        ask_client_ifaces(new, {cfg["dev"]} | {c["dev"] for c in clients if "dev" in c})
+    ask_shared_iface(new, clients[-1].get("dev") or cfg.get("dev"))
 
     keys_dir = tunnel_dir / "keys"
     server_public = read_key(keys_dir, "server", "pub")
@@ -247,7 +264,7 @@ def add_clients(wg, base_dir):
             c["private"], c["public"] = build_keypair(bar, wg, keys_dir, c["stem"], c["name"])
         bar.step("Writing configs")
         for c in new:
-            c["path"] = conf_path(tunnel_dir, c["name"], c.get("dev"))
+            c["path"] = subnet_client_path(tunnel_dir, c)
             write_private(c["path"], client_conf(cfg, c["private"], c["ip"], server_public))
         with open(server_path, "a") as f:
             for c in new:
