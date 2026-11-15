@@ -123,17 +123,11 @@ def conf_path(tunnel_dir, node, dev):
 
 
 def subnet_client_path(tunnel_dir, c):
-    """Subnet clients share one interface name (e.g. wg0), so their files sit side by side as
-    <tunnel>/<client-name>.conf; each is installed on its node as <iface>.conf."""
-    return tunnel_dir / f"{c['name']}.conf"
-
-
-def install_hint(clients):
-    devs = {c["dev"] for c in clients if c.get("dev")}
-    if len(devs) == 1:
-        dev = devs.pop()
-        print(f"\nOn each client node, install its config as /etc/wireguard/{dev}.conf"
-              f"\n  then: wg-quick up {dev}")
+    """Subnet clients share one interface name (e.g. wg0), so each gets its own folder:
+    <tunnel>/<client-name>/<iface>.conf."""
+    client_dir = tunnel_dir / c["name"]
+    client_dir.mkdir(mode=0o700)
+    return client_dir / f"{c['dev']}.conf"
 
 
 def ask_shared_iface(clients):
@@ -236,8 +230,6 @@ def new_tunnel(wg, base_dir):
     print(f"  server: {server_path}  ({cfg['name']}-server, {cfg['server_ip']})")
     for c in clients:
         print(f"  client: {c['path']}  ({c['name']}, {c['ip']})")
-    if cfg["topology"] == "subnet":
-        install_hint(clients)
 
 
 def add_clients(wg, base_dir):
@@ -282,7 +274,6 @@ def add_clients(wg, base_dir):
     print(f"\nDone. Added {n_new} client(s) to '{name}'")
     for c in new:
         print(f"  client: {c['path']}  ({c['name']}, {c['ip']})")
-    install_hint(new)
     print(f"\nThe server config gained {n_new} [Peer] block(s): {server_path}"
           "\nCopy it to the server node, then load it without dropping existing peers:"
           f"\n  wg syncconf {server_iface} <(wg-quick strip {server_iface})")
