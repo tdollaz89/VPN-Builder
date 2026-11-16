@@ -378,17 +378,21 @@ def add_clients(easyrsa, openvpn, base_dir):
           f" {name}-client*), so there is nothing to redeploy on the server.")
 
 
+DEFAULT_BASE_DIR = "/opt/openvpn"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--base-dir", default="/opt/openvpn",
-                        help="parent directory for tunnel folders (default: /opt/openvpn)")
+    parser.add_argument("--base-dir", default=DEFAULT_BASE_DIR,
+                        help=f"parent directory for tunnel folders (default: {DEFAULT_BASE_DIR})")
     args = parser.parse_args()
+    print("OpenVPN tunnel builder\n")
+    build(Path(args.base_dir))
 
+
+def build(base_dir):
     easyrsa = find_easyrsa()
     openvpn = find_openvpn()
-    base_dir = Path(args.base_dir)
-
-    print("OpenVPN tunnel builder\n")
     action = menu("What would you like to do?", [
         ("new", "Build a new tunnel"),
         ("add", "Add clients to an existing tunnel"),

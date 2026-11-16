@@ -279,16 +279,20 @@ def add_clients(wg, base_dir):
           f"\n  wg syncconf {server_iface} <(wg-quick strip {server_iface})")
 
 
+DEFAULT_BASE_DIR = "/opt/wireguard"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--base-dir", default="/opt/wireguard",
-                        help="parent directory for tunnel folders (default: /opt/wireguard)")
+    parser.add_argument("--base-dir", default=DEFAULT_BASE_DIR,
+                        help=f"parent directory for tunnel folders (default: {DEFAULT_BASE_DIR})")
     args = parser.parse_args()
-
-    wg = find_wg()
-    base_dir = Path(args.base_dir)
-
     print("WireGuard tunnel builder\n")
+    build(Path(args.base_dir))
+
+
+def build(base_dir):
+    wg = find_wg()
     action = menu("What would you like to do?", [
         ("new", "Build a new tunnel"),
         ("add", "Add clients to an existing tunnel"),
