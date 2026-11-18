@@ -3,7 +3,7 @@
 
 Mirrors the manual workflow:
   server: ip_forward, PermitTunnel + ClientAlive in sshd, a persistent tun owned by the
-          SSH user (systemd-networkd .netdev + networkd-dispatcher script), nftables NAT
+          SSH user (systemd-networkd .netdev + networkd-dispatcher script)
   client: tun device, static route to the server, `ssh -fqNTw`, default route through the
           tunnel, public DNS; then undo it all on the way down
 
@@ -20,7 +20,7 @@ import re
 import sys
 from pathlib import Path
 
-from common import (BuildError, Progress, address, ask, choice, claim, hand_back, ifname, port,
+from common import (BuildError, Progress, address, ask, choice, claim, hand_back, port,
                     tunnel_name, write_private)
 
 DEFAULT_BASE_DIR = "/opt/sshvpn"
@@ -92,52 +92,6 @@ DISPATCHER = """\
 /sbin/ip link set dev {{server_dev}} up
 """
 
-NFTABLES = """\
-#!/usr/sbin/nft -f
-# {{name}} SSH VPN server firewall. This replaces the WHOLE ruleset: merge it by hand if
-# this server already has rules (e.g. another VPN's port, or its own NAT/forward rules).
-
-flush ruleset
-
-table inet filter {
-        chain input {
-                type filter hook input priority filter; policy drop;
-                ct state established,related accept
-                ct state invalid drop
-                iif "lo" accept
-                ip protocol icmp accept
-                tcp dport {{port}} counter accept
-                log prefix "nftables input dropped: "
-        }
-        chain forward {
-                type filter hook forward priority filter; policy drop;
-                ct state established,related accept
-                ct state invalid drop
-                iifname "{{server_dev}}" oifname "{{wan}}" counter accept
-                log prefix "nftables forward dropped: "
-        }
-        chain output {
-                type filter hook output priority filter; policy drop;
-                ct state established,related accept
-                ct state invalid drop
-                oif "lo" accept
-                ip protocol icmp accept
-                udp dport { 53, 123 } counter accept
-                tcp dport { 80, 443 } counter accept
-                log prefix "nftables output dropped: "
-        }
-}
-table inet nat {
-        chain prerouting {
-                type nat hook prerouting priority dstnat; policy accept;
-        }
-        chain postrouting {
-                type nat hook postrouting priority srcnat; policy accept;
-                oifname "{{wan}}" counter masquerade
-        }
-}
-"""
-
 SERVER_INSTALL = """\
 #!/bin/bash
 # {{name}} SSH VPN: server side. Run on the server with sudo from inside this folder.
@@ -169,8 +123,7 @@ ip address show dev {{server_dev}}
 echo
 echo "Next: on the client, run client/install.sh. It makes the SSH key and tries to authorize it"
 echo "here over a password login; if that is off, copy its .pub here and run: sudo ./authorize-key.sh <file>.pub"
-echo "Firewall/NAT is NOT applied automatically (nftables.conf replaces the whole ruleset)."
-echo "Review it, then:  sudo cp nftables.conf /etc/nftables.conf && sudo nft -f /etc/nftables.conf"
+echo "Firewall/NAT is not set up here: the server must forward {{server_dev}} traffic and masquerade it out to the internet."
 """
 
 
@@ -369,7 +322,6 @@ def new_tunnel(base_dir):
     cfg["remote"] = ask("Server public IP/hostname")
     cfg["port"] = ask("Server SSH port", 22, port)
     cfg["server_user"] = ask("SSH user on the server", validate=username)
-    cfg["wan"] = ask("Server internet-facing interface (for NAT)", "ens33", ifname)
     cfg["route_mode"] = ask("Send all client traffic via (hijack/replace)", "hijack",
                             choice(["hijack", "replace"]))
     cfg["dns"] = ask("DNS server while the VPN is up", "1.1.1.1", address)
@@ -405,7 +357,6 @@ def new_tunnel(base_dir):
             "sshd.conf": (SSHD, 0o600),
             f"{cfg['server_dev']}.netdev": (NETDEV, 0o600),
             f"99-{cfg['server_dev']}": (DISPATCHER, 0o700),
-            "nftables.conf": (NFTABLES, 0o600),
             "authorize-key.sh": (AUTHORIZE, 0o700),
         }
         for fname, (template, mode) in server_files.items():
@@ -428,7 +379,7 @@ def new_tunnel(base_dir):
     print(f"  server: {server_dir}/  ({cfg['server_dev']}, {cfg['server_ip']})")
     print(f"  client: {client_dir}/  ({cfg['client_dev']}, {cfg['client_ip']})")
     print(f"\n1. Server ({cfg['remote']}): sudo {server_dir}/install.sh"
-          f"\n   sshd must already listen on port {cfg['port']}; review nftables.conf before applying it."
+          f"\n   sshd must already listen on port {cfg['port']}; firewall/NAT is up to you."
           f"\n2. Client: copy client/ over, then  ./install.sh   (as your normal user)"
           f"\n   It makes the SSH key there and authorizes it on the server.")
     print(f"3. Client: VPN up: {name}-up    VPN down: {name}-down")

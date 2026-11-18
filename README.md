@@ -109,7 +109,6 @@ The builder is meant to be run **on the server**. It asks for:
 - server and client tun devices (must be `tunN`, because `ssh -w` uses the number)
 - server public IP and SSH port
 - the SSH user on the server
-- the server's internet-facing interface for NAT (default `ens33`)
 - how to route the client's traffic (`hijack` or `replace`)
 - the DNS server to use while the VPN is up (default `1.1.1.1`)
 
@@ -121,8 +120,7 @@ The builder is meant to be run **on the server**. It asks for:
 │   ├── sysctl.conf         net.ipv4.ip_forward=1
 │   ├── sshd.conf           PermitTunnel yes + ClientAlive keepalive
 │   ├── tun0.netdev         persistent tun0 owned by the SSH user
-│   ├── 99-tun0             networkd-dispatcher script that addresses tun0
-│   └── nftables.conf       firewall + NAT (not applied automatically)
+│   └── 99-tun0             networkd-dispatcher script that addresses tun0
 ├── client/
 │   ├── install.sh          run as your normal user on the client
 │   ├── ssh_config          "Host fortune" block with keepalives
@@ -139,10 +137,7 @@ The builder is meant to be run **on the server**. It asks for:
    ```
    This installs the sysctl, sshd and networkd files into their system locations, restarts sshd and brings up the tun device.
    - **Port:** sshd must already be listening on the port you entered; the installer doesn't change it.
-   - **Firewall:** `nftables.conf` is **not** applied, because it replaces the whole ruleset. On a server that runs other things (like fe1, which also hosts an OpenVPN tunnel), merge its NAT and forward rules into your existing config by hand. On a server with no other rules, you can apply it as-is:
-     ```bash
-     sudo cp server/nftables.conf /etc/nftables.conf && sudo nft -f /etc/nftables.conf
-     ```
+   - **Firewall/NAT:** not handled here. The server's firewall must let traffic from the tun device be forwarded and masqueraded out to the internet, or the client gets a tunnel but no internet through it.
 
 2. **Client.** Copy `client/` over, then run it as your normal user (not sudo):
    ```bash
