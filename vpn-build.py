@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Build a WireGuard or OpenVPN tunnel: pick the VPN, then build a new tunnel or add clients.
+"""Build a WireGuard, OpenVPN or SSH VPN tunnel: pick the VPN, then answer its questions.
 
-Runs the same builders as wg-build.py and ovpn-build.py (which still work on their own).
+Runs the same builders as wg-build.py, ovpn-build.py and ssh-build.py (which still work on their own).
 
 Requires: python3, plus the chosen VPN's tools:
   WireGuard: wireguard-tools   (Ubuntu: apt install wireguard-tools)
   OpenVPN:   easy-rsa, openvpn (Ubuntu: apt install easy-rsa openvpn)
+  SSH VPN:   openssh (ssh-keygen)
 """
 import argparse
 import importlib.util
@@ -18,6 +19,7 @@ HERE = Path(__file__).resolve().parent
 BUILDERS = {
     "wireguard": ("WireGuard", "wg-build.py"),
     "openvpn": ("OpenVPN", "ovpn-build.py"),
+    "ssh": ("SSH VPN", "ssh-build.py"),
 }
 
 
@@ -33,7 +35,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-dir",
                         help="parent directory for tunnel folders "
-                             "(default: /opt/wireguard or /opt/openvpn)")
+                             "(default: /opt/wireguard, /opt/openvpn or /opt/sshvpn)")
     args = parser.parse_args()
 
     print("VPN tunnel builder\n")
