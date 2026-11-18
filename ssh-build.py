@@ -45,6 +45,13 @@ def username(val):
     return val
 
 
+def key_path(val):
+    """A path on the client (not checked here; the builder runs on the server)."""
+    if any(c.isspace() for c in val) or val.endswith(".pub"):
+        raise ValueError("Give the private key path (no spaces, not the .pub), e.g. ~/.ssh/id_ed25519")
+    return val
+
+
 def tun_number(dev):
     return TUN_RE.match(dev).group(1)
 
@@ -121,8 +128,9 @@ echo "[4/4] check"
 ip address show dev {{server_dev}}
 
 echo
-echo "Next: on the client, run client/install.sh. It makes the SSH key and tries to authorize it"
-echo "here over a password login; if that is off, copy its .pub here and run: sudo ./authorize-key.sh <file>.pub"
+echo "Next: on the client, run client/install.sh. It makes the SSH key and copies it here by logging in"
+echo "with a key this server already accepts ('Host {{name}}-setup'). If that fails, copy its .pub here"
+echo "and run: sudo ./authorize-key.sh <file>.pub"
 echo "Firewall/NAT is not set up here: the server must forward {{server_dev}} traffic and masquerade it out to the internet."
 """
 
@@ -165,6 +173,17 @@ Host {{name}}
     StrictHostKeyChecking accept-new
     ServerAliveInterval {{interval}}
     ServerAliveCountMax {{count}}
+"""
+
+# one-time login used by install.sh to copy the tunnel key over: an existing key the server
+# already accepts (agent and default keys are tried too, then a password as a last resort)
+SSH_CONFIG_SETUP = """\
+Host {{name}}-setup
+    Hostname {{remote}}
+    Port {{port}}
+    User {{server_user}}
+    IdentityFile {{setup_key}}
+    StrictHostKeyChecking accept-new
 """
 
 UP = """\
@@ -263,11 +282,18 @@ sudo rm -f "$STATE"
 CLIENT_INSTALL = """\
 #!/bin/bash
 # {{name}} SSH VPN: client side. Run as your normal user from inside this folder.
+# Usage: ./install.sh [existing-key]
+#   existing-key: a private key the server already accepts for {{server_user}}, used once to
+#   copy the new tunnel key over (default: the one in 'Host {{name}}-setup', {{setup_key}})
 set -euo pipefail
 [ "$EUID" -ne 0 ] || { echo "Run as your normal user, not root/sudo."; exit 1; }
 cd "$(dirname "$0")"
 
 KEY=~/.ssh/{{name}}_ed25519
+SETUP_KEY=${1:-}
+if [ -n "$SETUP_KEY" ] && [ ! -f "$SETUP_KEY" ]; then
+    echo "No such key: $SETUP_KEY"; exit 1
+fi
 
 install -d -m 700 ~/.ssh
 if [ -f "$KEY" ]; then
@@ -277,24 +303,32 @@ else
     echo "Created key $KEY (the private key stays on this machine)"
 fi
 touch ~/.ssh/config && chmod 600 ~/.ssh/config
-if grep -qE '^Host {{name}}$' ~/.ssh/config; then
-    echo "~/.ssh/config already has 'Host {{name}}'; left it alone."
-else
-    { echo; cat ssh_config; } >> ~/.ssh/config
-fi
+for host in {{name}} {{name}}-setup; do
+    if grep -qE "^Host $host\\$" ~/.ssh/config; then
+        echo "~/.ssh/config already has 'Host $host'; left it alone."
+    else
+        { echo; cat "ssh_config.$host"; } >> ~/.ssh/config
+        echo "Added 'Host $host' to ~/.ssh/config"
+    fi
+done
 sudo install -m 755 {{name}}-up {{name}}-down /usr/local/bin/
 
-# authorize the key on the server, locked to the tunnel. Needs a password login once.
+# Copy the tunnel key to the server over the existing-key login ({{name}}-setup).
+# Same job as ssh-copy-id, which can't add the tunnel="N",no-pty,... lock in front of the key.
 LINE='{{restrict}}'" $(cat "$KEY.pub")"
+SSH_SETUP=(ssh)
+[ -z "$SETUP_KEY" ] || SSH_SETUP+=(-i "$SETUP_KEY")
 echo
-echo "Authorizing the key on {{remote}} as {{server_user}} (enter that user's password if asked)..."
-if printf '%s\\n' "$LINE" | ssh -o PreferredAuthentications=password,keyboard-interactive {{name}} \\
+echo "Authorizing the key on {{remote}} as {{server_user}} via 'Host {{name}}-setup'..."
+if printf '%s\\n' "$LINE" | "${SSH_SETUP[@]}" {{name}}-setup \\
     'umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; read -r line;
      grep -qF "${line#* }" ~/.ssh/authorized_keys || printf "%s\\n" "$line" >> ~/.ssh/authorized_keys'; then
     echo "Key authorized."
 else
-    echo "Could not log in with a password. Copy $KEY.pub to the server's {{name}}/server folder and run:"
-    echo "  sudo ./authorize-key.sh {{name}}_ed25519.pub"
+    echo "Could not log in to the server with an existing key or a password. Either:"
+    echo "  - rerun with a key the server accepts:  ./install.sh ~/.ssh/<that key>"
+    echo "  - or copy $KEY.pub to the server's {{name}}/server folder and run there:"
+    echo "      sudo ./authorize-key.sh {{name}}_ed25519.pub"
 fi
 
 echo
@@ -322,6 +356,8 @@ def new_tunnel(base_dir):
     cfg["remote"] = ask("Server public IP/hostname")
     cfg["port"] = ask("Server SSH port", 22, port)
     cfg["server_user"] = ask("SSH user on the server", validate=username)
+    cfg["setup_key"] = ask("Client's existing key the server already accepts (copies the tunnel key)",
+                           "~/.ssh/id_ed25519", key_path)
     cfg["route_mode"] = ask("Send all client traffic via (hijack/replace)", "hijack",
                             choice(["hijack", "replace"]))
     cfg["dns"] = ask("DNS server while the VPN is up", "1.1.1.1", address)
@@ -365,7 +401,8 @@ def new_tunnel(base_dir):
         bar.step("Writing client files")
         client_files = {
             "install.sh": (CLIENT_INSTALL, 0o700),
-            "ssh_config": (SSH_CONFIG, 0o600),
+            f"ssh_config.{name}": (SSH_CONFIG, 0o600),
+            f"ssh_config.{name}-setup": (SSH_CONFIG_SETUP, 0o600),
             f"{name}-up": (UP, 0o700),
             f"{name}-down": (DOWN, 0o700),
         }

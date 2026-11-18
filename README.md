@@ -109,6 +109,7 @@ The builder is meant to be run **on the server**. It asks for:
 - server and client tun devices (must be `tunN`, because `ssh -w` uses the number)
 - server public IP and SSH port
 - the SSH user on the server
+- a key the client already uses to log in to the server (default `~/.ssh/id_ed25519`), for the one-time copy of the tunnel key
 - how to route the client's traffic (`hijack` or `replace`)
 - the DNS server to use while the VPN is up (default `1.1.1.1`)
 
@@ -123,7 +124,8 @@ The builder is meant to be run **on the server**. It asks for:
 │   └── 99-tun0             networkd-dispatcher script that addresses tun0
 ├── client/
 │   ├── install.sh          run as your normal user on the client
-│   ├── ssh_config          "Host fortune" block with keepalives
+│   ├── ssh_config.fortune        "Host fortune": tunnel login with keepalives
+│   ├── ssh_config.fortune-setup  "Host fortune-setup": one-time login to copy the key
 │   ├── fortune-up
 │   └── fortune-down
 └── tunnel.json
@@ -145,13 +147,19 @@ The builder is meant to be run **on the server**. It asks for:
    ```
    It:
    - **creates the SSH key on the client** (`~/.ssh/<name>_ed25519`), so the private key never leaves that machine
-   - adds the `Host <name>` block to `~/.ssh/config`
+   - adds two `Host` blocks to `~/.ssh/config`:
+     - `<name>`: the tunnel login, using only the new key
+     - `<name>-setup`: a one-time login with the key you named when building, which the server already accepts
    - installs `<name>-up` and `<name>-down` into `/usr/local/bin`
-   - logs into the server once with the SSH user's password and adds the public key to that user's `authorized_keys`
+   - logs in as `<name>-setup` and adds the new public key to the SSH user's `authorized_keys`, like `ssh-copy-id -i <name>_ed25519.pub <name>-setup` would
 
-   On the server, the key is restricted to this tunnel's tun device: no shell, no port forwarding.
+   It doesn't call `ssh-copy-id` itself because that can't add the lock that goes in front of the key: on the server, the tunnel key can only open this tunnel's tun device. It gets no shell and no port forwarding.
 
-   If password login is disabled on the server, copy `~/.ssh/<name>_ed25519.pub` into the server's `server/` folder and run this there:
+   For the `<name>-setup` login, ssh tries the key from the build questions, then your ssh-agent and default keys, then a password. To use a different key, pass it to the installer:
+   ```bash
+   ./install.sh ~/.ssh/other_key
+   ```
+   If none of those work, copy `~/.ssh/<name>_ed25519.pub` into the server's `server/` folder and run this there:
    ```bash
    sudo ./authorize-key.sh <name>_ed25519.pub
    ```
