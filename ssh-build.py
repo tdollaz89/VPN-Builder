@@ -45,13 +45,6 @@ def username(val):
     return val
 
 
-def key_path(val):
-    """A path on the client (not checked here; the builder runs on the server)."""
-    if any(c.isspace() for c in val) or val.endswith(".pub"):
-        raise ValueError("Give the private key path (no spaces, not the .pub), e.g. ~/.ssh/id_ed25519")
-    return val
-
-
 def tun_number(dev):
     return TUN_RE.match(dev).group(1)
 
@@ -128,9 +121,8 @@ echo "[4/4] check"
 ip address show dev {{server_dev}}
 
 echo
-echo "Next: on the client, run client/install.sh. It makes the SSH key and copies it here by logging in"
-echo "with a key this server already accepts ('Host {{name}}-setup'). If that fails, copy its .pub here"
-echo "and run: sudo ./authorize-key.sh <file>.pub"
+echo "Next: on the client, run client/install.sh. It makes the SSH key and prints its public key."
+echo "Then back here run:  sudo ./authorize-key.sh   and paste that line when asked."
 echo "Firewall/NAT is not set up here: the server must forward {{server_dev}} traffic and masquerade it out to the internet."
 """
 
@@ -138,12 +130,23 @@ echo "Firewall/NAT is not set up here: the server must forward {{server_dev}} tr
 AUTHORIZE = """\
 #!/bin/bash
 # {{name}} SSH VPN: authorize a client's public key for {{server_user}}, locked to {{server_dev}}.
-# Usage: sudo ./authorize-key.sh {{name}}_ed25519.pub
+# Usage: sudo ./authorize-key.sh               (paste the line client/install.sh printed)
+#        sudo ./authorize-key.sh key.pub       (or read it from a file)
 set -euo pipefail
 [ "$EUID" -eq 0 ] || { echo "Run with sudo."; exit 1; }
-[ $# -eq 1 ] && [ -f "$1" ] || { echo "Usage: sudo $0 <client public key file>"; exit 1; }
-key=$(head -n1 "$1")
-case "$key" in ssh-*|ecdsa-*) ;; *) echo "$1 does not look like an SSH public key."; exit 1 ;; esac
+if [ $# -ge 1 ]; then
+    [ -f "$1" ] || { echo "No such file: $1"; exit 1; }
+    key=$(head -n1 "$1")
+else
+    echo "Paste the client's public key (the ssh-ed25519 ... line), then press Enter:"
+    read -r key
+fi
+key=$(printf '%s' "$key" | tr -d '\\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+case "$key" in
+    ssh-*|ecdsa-*) ;;
+    *) echo "That doesn't look like an SSH public key (it should start with ssh-ed25519)."; exit 1 ;;
+esac
+ssh-keygen -l -f /dev/stdin <<<"$key" >/dev/null 2>&1 || { echo "That key is incomplete or damaged; copy the whole line again."; exit 1; }
 line='{{restrict}}'" $key"
 
 home=$(getent passwd {{server_user}} | cut -d: -f6)
@@ -158,6 +161,7 @@ else
 fi
 chown {{server_user}}:"$group" "$home/.ssh/authorized_keys"
 chmod 600 "$home/.ssh/authorized_keys"
+echo "The client can now run: {{name}}-up"
 """
 
 
@@ -175,17 +179,6 @@ Host {{name}}
     ServerAliveCountMax {{count}}
 """
 
-# one-time login used by install.sh to copy the tunnel key over: an existing key the server
-# already accepts (agent and default keys are tried too, then a password as a last resort)
-SSH_CONFIG_SETUP = """\
-Host {{name}}-setup
-    Hostname {{remote}}
-    Port {{port}}
-    User {{server_user}}
-    IdentityFile {{setup_key}}
-    StrictHostKeyChecking accept-new
-"""
-
 UP = """\
 #!/bin/bash
 # Bring up the {{name}} SSH VPN: {{client_dev}} {{client_ip}} <-> {{server_dev}} {{server_ip}} on {{remote}}
@@ -197,8 +190,10 @@ LOCAL_IP={{client_ip}}
 PEER_IP={{server_ip}}
 SERVER={{remote}}
 SSH_W={{client_tun}}:{{server_tun}}
-DNS={{dns}}
+# none: only the tunnel itself (internet keeps using this machine's own gateway)
+# hijack/replace: send all traffic through the tunnel, with DNS switched to $DNS
 ROUTE_MODE={{route_mode}}
+DNS={{dns}}
 STATE=/run/$NAME-ssh-vpn.state
 DOWN="$(dirname "$(readlink -f "$0")")/$NAME-down"
 
@@ -207,27 +202,31 @@ if ip link show "$TUN" >/dev/null 2>&1; then
     echo "$TUN already exists; is the VPN already up? Run $NAME-down first."; exit 1
 fi
 
-read -r GW DEV < <(ip -4 route show default | awk '{for (i = 1; i < NF; i++) {
-    if ($i == "via") g = $(i + 1); if ($i == "dev") d = $(i + 1) } print g, d; exit}')
-[ -n "${GW:-}" ] && [ -n "${DEV:-}" ] || { echo "No default route found."; exit 1; }
-SERVER_IP=$(getent ahostsv4 "$SERVER" | awk '{print $1; exit}')
-[ -n "$SERVER_IP" ] || { echo "Cannot resolve $SERVER."; exit 1; }
-OLD_DNS=""
-if command -v resolvectl >/dev/null; then
-    OLD_DNS=$(resolvectl dns "$DEV" 2>/dev/null | sed 's/^[^:]*: *//')
+if [ "$ROUTE_MODE" != none ]; then
+    read -r GW DEV < <(ip -4 route show default | awk '{for (i = 1; i < NF; i++) {
+        if ($i == "via") g = $(i + 1); if ($i == "dev") d = $(i + 1) } print g, d; exit}')
+    [ -n "${GW:-}" ] && [ -n "${DEV:-}" ] || { echo "No default route found."; exit 1; }
+    SERVER_IP=$(getent ahostsv4 "$SERVER" | awk '{print $1; exit}')
+    [ -n "$SERVER_IP" ] || { echo "Cannot resolve $SERVER."; exit 1; }
+    OLD_DNS=""
+    if command -v resolvectl >/dev/null; then
+        OLD_DNS=$(resolvectl dns "$DEV" 2>/dev/null | sed 's/^[^:]*: *//')
+    fi
+    echo "Your current IP: $(curl -s --max-time 5 ipinfo.io/ip || echo unknown)"
+    # saved so $NAME-down can put the gateway and DNS back
+    printf 'GW=%q\\nDEV=%q\\nSERVER_IP=%q\\nOLD_DNS=%q\\nROUTE_MODE=%q\\n' \\
+        "$GW" "$DEV" "$SERVER_IP" "$OLD_DNS" "$ROUTE_MODE" | sudo tee "$STATE" >/dev/null
 fi
-
-echo "Your current IP: $(curl -s --max-time 5 ipinfo.io/ip || echo unknown)"
-printf 'GW=%q\\nDEV=%q\\nSERVER_IP=%q\\nOLD_DNS=%q\\nROUTE_MODE=%q\\n' \\
-    "$GW" "$DEV" "$SERVER_IP" "$OLD_DNS" "$ROUTE_MODE" | sudo tee "$STATE" >/dev/null
 
 trap 'echo "Tunnel failed to come up; cleaning up."; "$DOWN" --quiet' ERR
 
 sudo ip tuntap add dev "$TUN" mode tun user "$USER" group "$(id -gn)"
 sudo ip address add "$LOCAL_IP/32" peer "$PEER_IP" dev "$TUN"
 sudo ip link set dev "$TUN" up
-# keep the ssh connection itself off the tunnel
-sudo ip route replace "$SERVER_IP/32" via "$GW" dev "$DEV"
+if [ "$ROUTE_MODE" != none ]; then
+    # keep the ssh connection itself off the tunnel once the default route moves
+    sudo ip route replace "$SERVER_IP/32" via "$GW" dev "$DEV"
+fi
 
 ssh -fqNT -w "$SSH_W" "$NAME"
 for _ in $(seq 10); do ping -c1 -W1 "$PEER_IP" >/dev/null 2>&1 && break; sleep 1; done
@@ -235,32 +234,36 @@ ping -c1 -W2 "$PEER_IP" >/dev/null
 
 if [ "$ROUTE_MODE" = replace ]; then
     sudo ip route replace default via "$PEER_IP" dev "$TUN"
-else
+elif [ "$ROUTE_MODE" = hijack ]; then
     sudo ip route add 0.0.0.0/1 via "$PEER_IP" dev "$TUN"
     sudo ip route add 128.0.0.0/1 via "$PEER_IP" dev "$TUN"
 fi
-if command -v resolvectl >/dev/null; then
+if [ "$ROUTE_MODE" != none ] && command -v resolvectl >/dev/null; then
     sudo resolvectl dns "$DEV" $DNS
     sudo resolvectl flush-caches
 fi
 trap - ERR
 
 echo "Tunnel up: $TUN $LOCAL_IP -> $PEER_IP"
-echo "Your new IP: $(curl -s --max-time 5 ipinfo.io/ip || echo unknown)"
+if [ "$ROUTE_MODE" != none ]; then
+    echo "Your new IP: $(curl -s --max-time 5 ipinfo.io/ip || echo unknown)"
+fi
 """
 
 DOWN = """\
 #!/bin/bash
-# Take down the {{name}} SSH VPN and restore routes and DNS.
+# Take down the {{name}} SSH VPN (and put the gateway and DNS back if {{name}}-up changed them).
 NAME={{name}}
 TUN={{client_dev}}
 SSH_W={{client_tun}}:{{server_tun}}
 STATE=/run/$NAME-ssh-vpn.state
 QUIET=${1:-}
 
-[ "$QUIET" = --quiet ] || echo "Your current IP: $(curl -s --max-time 5 ipinfo.io/ip || echo unknown)"
-GW="" DEV="" SERVER_IP="" OLD_DNS="" ROUTE_MODE=""
+GW="" DEV="" SERVER_IP="" OLD_DNS="" ROUTE_MODE=none
 [ -f "$STATE" ] && source "$STATE"
+if [ "$QUIET" != --quiet ] && [ "$ROUTE_MODE" != none ]; then
+    echo "Your current IP: $(curl -s --max-time 5 ipinfo.io/ip || echo unknown)"
+fi
 
 # only this tunnel's ssh process, not every ssh session
 pkill -u "$(id -u "${SUDO_USER:-$USER}")" -f "ssh -fqNT -w $SSH_W $NAME\\$" 2>/dev/null
@@ -270,30 +273,26 @@ if [ -n "$SERVER_IP" ]; then sudo ip route del "$SERVER_IP/32" 2>/dev/null; fi
 if [ "$ROUTE_MODE" = replace ] && [ -n "$GW" ]; then
     sudo ip route replace default via "$GW" dev "$DEV"
 fi
-if [ -n "$DEV" ] && command -v resolvectl >/dev/null; then
+if [ "$ROUTE_MODE" != none ] && [ -n "$DEV" ] && command -v resolvectl >/dev/null; then
     if [ -n "$OLD_DNS" ]; then sudo resolvectl dns "$DEV" $OLD_DNS; else sudo resolvectl revert "$DEV"; fi
     sudo resolvectl flush-caches
 fi
-sudo rm -f "$STATE"
+[ -f "$STATE" ] && sudo rm -f "$STATE"
 
-[ "$QUIET" = --quiet ] || echo "Tunnel down. Your IP: $(curl -s --max-time 5 ipinfo.io/ip || echo unknown)"
+if [ "$QUIET" != --quiet ]; then
+    echo "Tunnel down."
+    if [ "$ROUTE_MODE" != none ]; then echo "Your IP: $(curl -s --max-time 5 ipinfo.io/ip || echo unknown)"; fi
+fi
 """
 
 CLIENT_INSTALL = """\
 #!/bin/bash
 # {{name}} SSH VPN: client side. Run as your normal user from inside this folder.
-# Usage: ./install.sh [existing-key]
-#   existing-key: a private key the server already accepts for {{server_user}}, used once to
-#   copy the new tunnel key over (default: the one in 'Host {{name}}-setup', {{setup_key}})
 set -euo pipefail
 [ "$EUID" -ne 0 ] || { echo "Run as your normal user, not root/sudo."; exit 1; }
 cd "$(dirname "$0")"
 
 KEY=~/.ssh/{{name}}_ed25519
-SETUP_KEY=${1:-}
-if [ -n "$SETUP_KEY" ] && [ ! -f "$SETUP_KEY" ]; then
-    echo "No such key: $SETUP_KEY"; exit 1
-fi
 
 install -d -m 700 ~/.ssh
 if [ -f "$KEY" ]; then
@@ -303,36 +302,23 @@ else
     echo "Created key $KEY (the private key stays on this machine)"
 fi
 touch ~/.ssh/config && chmod 600 ~/.ssh/config
-for host in {{name}} {{name}}-setup; do
-    if grep -qE "^Host $host\\$" ~/.ssh/config; then
-        echo "~/.ssh/config already has 'Host $host'; left it alone."
-    else
-        { echo; cat "ssh_config.$host"; } >> ~/.ssh/config
-        echo "Added 'Host $host' to ~/.ssh/config"
-    fi
-done
-sudo install -m 755 {{name}}-up {{name}}-down /usr/local/bin/
-
-# Copy the tunnel key to the server over the existing-key login ({{name}}-setup).
-# Same job as ssh-copy-id, which can't add the tunnel="N",no-pty,... lock in front of the key.
-LINE='{{restrict}}'" $(cat "$KEY.pub")"
-SSH_SETUP=(ssh)
-[ -z "$SETUP_KEY" ] || SSH_SETUP+=(-i "$SETUP_KEY")
-echo
-echo "Authorizing the key on {{remote}} as {{server_user}} via 'Host {{name}}-setup'..."
-if printf '%s\\n' "$LINE" | "${SSH_SETUP[@]}" {{name}}-setup \\
-    'umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; read -r line;
-     grep -qF "${line#* }" ~/.ssh/authorized_keys || printf "%s\\n" "$line" >> ~/.ssh/authorized_keys'; then
-    echo "Key authorized."
+if grep -qE '^Host {{name}}$' ~/.ssh/config; then
+    echo "~/.ssh/config already has 'Host {{name}}'; left it alone."
 else
-    echo "Could not log in to the server with an existing key or a password. Either:"
-    echo "  - rerun with a key the server accepts:  ./install.sh ~/.ssh/<that key>"
-    echo "  - or copy $KEY.pub to the server's {{name}}/server folder and run there:"
-    echo "      sudo ./authorize-key.sh {{name}}_ed25519.pub"
+    { echo; cat ssh_config; } >> ~/.ssh/config
+    echo "Added 'Host {{name}}' to ~/.ssh/config"
 fi
+sudo install -m 755 {{name}}-up {{name}}-down /usr/local/bin/
+echo "Installed {{name}}-up and {{name}}-down"
 
 echo
-echo "Installed. Bring the VPN up with: {{name}}-up    and down with: {{name}}-down"
+echo "Last step: authorize this key on the server ({{remote}})."
+echo "In the {{name}}/server folder there, run:  sudo ./authorize-key.sh"
+echo "and paste this line when asked:"
+echo
+cat "$KEY.pub"
+echo
+echo "Then bring the VPN up here with: {{name}}-up    (and down with: {{name}}-down)"
 """
 
 
@@ -356,11 +342,16 @@ def new_tunnel(base_dir):
     cfg["remote"] = ask("Server public IP/hostname")
     cfg["port"] = ask("Server SSH port", 22, port)
     cfg["server_user"] = ask("SSH user on the server", validate=username)
-    cfg["setup_key"] = ask("Client's existing key the server already accepts (copies the tunnel key)",
-                           "~/.ssh/id_ed25519", key_path)
-    cfg["route_mode"] = ask("Send all client traffic via (hijack/replace)", "hijack",
-                            choice(["hijack", "replace"]))
-    cfg["dns"] = ask("DNS server while the VPN is up", "1.1.1.1", address)
+    full = ask("Change the client's default gateway to send ALL traffic through the tunnel? (y/n)",
+               "n", choice(["y", "n", "yes", "no"]))
+    if full.startswith("y"):
+        print("  hijack:  adds 0.0.0.0/1 + 128.0.0.0/1 via the tunnel; the original default stays")
+        print("  replace: swaps the default route for one via the tunnel; restored on down")
+        cfg["route_mode"] = ask("Gateway method (hijack/replace)", "hijack", choice(["hijack", "replace"]))
+        cfg["dns"] = ask("DNS server while the VPN is up", "1.1.1.1", address)
+    else:
+        cfg["route_mode"] = "none"
+        cfg["dns"] = ""
 
     try:
         if not base_dir.exists():
@@ -401,8 +392,7 @@ def new_tunnel(base_dir):
         bar.step("Writing client files")
         client_files = {
             "install.sh": (CLIENT_INSTALL, 0o700),
-            f"ssh_config.{name}": (SSH_CONFIG, 0o600),
-            f"ssh_config.{name}-setup": (SSH_CONFIG_SETUP, 0o600),
+            "ssh_config": (SSH_CONFIG, 0o600),
             f"{name}-up": (UP, 0o700),
             f"{name}-down": (DOWN, 0o700),
         }
@@ -418,7 +408,8 @@ def new_tunnel(base_dir):
     print(f"\n1. Server ({cfg['remote']}): sudo {server_dir}/install.sh"
           f"\n   sshd must already listen on port {cfg['port']}; firewall/NAT is up to you."
           f"\n2. Client: copy client/ over, then  ./install.sh   (as your normal user)"
-          f"\n   It makes the SSH key there and authorizes it on the server.")
+          f"\n   It makes the SSH key there and prints the public key."
+          f"\n   Back on the server: sudo {server_dir}/authorize-key.sh   and paste it.")
     print(f"3. Client: VPN up: {name}-up    VPN down: {name}-down")
 
 

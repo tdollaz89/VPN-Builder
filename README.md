@@ -109,23 +109,22 @@ The builder is meant to be run **on the server**. It asks for:
 - server and client tun devices (must be `tunN`, because `ssh -w` uses the number)
 - server public IP and SSH port
 - the SSH user on the server
-- a key the client already uses to log in to the server (default `~/.ssh/id_ed25519`), for the one-time copy of the tunnel key
-- how to route the client's traffic (`hijack` or `replace`)
-- the DNS server to use while the VPN is up (default `1.1.1.1`)
+- whether to change the client's default gateway (default **no**). If you answer yes, it also asks:
+  - the method, `hijack` or `replace`
+  - the DNS server to use while the VPN is up (default `1.1.1.1`)
 
 ```
 /opt/sshvpn/fortune/
 ├── server/
 │   ├── install.sh          run with sudo on the server
-│   ├── authorize-key.sh    fallback for authorizing the client's key
+│   ├── authorize-key.sh    authorizes the client's key (paste it in)
 │   ├── sysctl.conf         net.ipv4.ip_forward=1
 │   ├── sshd.conf           PermitTunnel yes + ClientAlive keepalive
 │   ├── tun0.netdev         persistent tun0 owned by the SSH user
 │   └── 99-tun0             networkd-dispatcher script that addresses tun0
 ├── client/
 │   ├── install.sh          run as your normal user on the client
-│   ├── ssh_config.fortune        "Host fortune": tunnel login with keepalives
-│   ├── ssh_config.fortune-setup  "Host fortune-setup": one-time login to copy the key
+│   ├── ssh_config          "Host fortune": tunnel login with keepalives
 │   ├── fortune-up
 │   └── fortune-down
 └── tunnel.json
@@ -147,46 +146,43 @@ The builder is meant to be run **on the server**. It asks for:
    ```
    It:
    - **creates the SSH key on the client** (`~/.ssh/<name>_ed25519`), so the private key never leaves that machine
-   - adds two `Host` blocks to `~/.ssh/config`:
-     - `<name>`: the tunnel login, using only the new key
-     - `<name>-setup`: a one-time login with the key you named when building, which the server already accepts
+   - adds a `Host <name>` block to `~/.ssh/config` that logs in with only that key
    - installs `<name>-up` and `<name>-down` into `/usr/local/bin`
-   - logs in as `<name>-setup` and adds the new public key to the SSH user's `authorized_keys`, like `ssh-copy-id -i <name>_ed25519.pub <name>-setup` would
+   - prints the public key (one `ssh-ed25519 ...` line) for you to copy
 
-   It doesn't call `ssh-copy-id` itself because that can't add the lock that goes in front of the key: on the server, the tunnel key can only open this tunnel's tun device. It gets no shell and no port forwarding.
-
-   For the `<name>-setup` login, ssh tries the key from the build questions, then your ssh-agent and default keys, then a password. To use a different key, pass it to the installer:
+3. **Server: authorize the key.** In the tunnel's `server/` folder:
    ```bash
-   ./install.sh ~/.ssh/other_key
+   sudo ./authorize-key.sh
    ```
-   If none of those work, copy `~/.ssh/<name>_ed25519.pub` into the server's `server/` folder and run this there:
-   ```bash
-   sudo ./authorize-key.sh <name>_ed25519.pub
-   ```
+   Paste the line when asked. It's added to the SSH user's `authorized_keys`, locked to this tunnel's tun device: no shell and no port forwarding. A partial or garbled paste is rejected, and pasting the same key twice adds it only once. If you have the `.pub` file on the server, you can give it instead: `sudo ./authorize-key.sh fortune_ed25519.pub`.
 
-3. **Use it**, on the client as your normal user:
+   Copying the public key across by hand is safe because it isn't secret. Some step like this is unavoidable: the server only accepts a new key from someone who can already log in (a password, an existing key, or you on the server).
+
+4. **Use it**, on the client as your normal user:
    ```bash
-   fortune-up      # prints your public IP before and after
+   fortune-up      # with the gateway changed, prints your public IP before and after
    fortune-down
    ```
 
 ### What up and down do
 
-`<name>-up`:
-1. Detects your default gateway and interface, and saves them along with your current DNS server to `/run/<name>-ssh-vpn.state`.
-2. Creates the tun device and gives it an address.
-3. Adds a static route to the server so the SSH connection itself stays off the tunnel.
-4. Runs `ssh -fqNT -w 0:0 <name>` and waits until the far end answers a ping.
-5. Sends all traffic through the tunnel and switches DNS so lookups don't leak:
-   - **hijack** (default) adds `0.0.0.0/1` and `128.0.0.0/1` routes through the tunnel. These are more specific than your default route and disappear when the tunnel does.
-   - **replace** swaps your default route for one through the tunnel.
-6. If any step fails, it runs `<name>-down` to clean up.
+**Default gateway left alone (the default).** This is a split tunnel. The client keeps using its own gateway (`eth0`, `wlan0`, ...) for the internet, and only traffic addressed through the tunnel goes into it. To start with, that's just the server's tunnel IP. To reach networks behind the server, add a route through the tunnel, e.g. `sudo ip route add 172.x.6.0/24 via 172.x.5.1 dev tun0`. The server must also forward that traffic and have a way to send replies back.
 
-`<name>-down` undoes everything:
-- kills only this tunnel's ssh process, not your other SSH sessions
-- deletes the tun device and the static route to the server
-- puts the original default route back (replace mode)
-- restores your original DNS server
+`<name>-up`:
+1. Creates the tun device and gives it an address.
+2. Runs `ssh -fqNT -w 0:0 <name>` and waits until the far end answers a ping.
+3. If any step fails, runs `<name>-down` to clean up.
+
+`<name>-down` kills only this tunnel's ssh process (not your other SSH sessions) and deletes the tun device.
+
+**Default gateway changed.** All of the client's traffic goes out through the server, as in the lesson's "SSH VPN to proxy web traffic" section. `<name>-up` does the steps above, plus:
+- **Before:** saves your gateway, interface and DNS server to `/run/<name>-ssh-vpn.state`.
+- **Route to the server:** adds a static route to the server, so the SSH connection itself stays off the tunnel.
+- **After the tunnel is up:** moves the default route and switches DNS so lookups don't leak:
+  - **hijack** (default) adds `0.0.0.0/1` and `128.0.0.0/1` routes through the tunnel. These are more specific than your default route, and they disappear when the tunnel does.
+  - **replace** swaps your default route for one through the tunnel.
+
+`<name>-down` also removes the static route, puts the original default route back (replace mode) and restores your DNS server.
 
 ---
 
